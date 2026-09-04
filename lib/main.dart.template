@@ -1,0 +1,77 @@
+import 'package:flutter/material.dart';
+import 'package:webview_flutter/webview_flutter.dart';
+import 'package:tailscale/tailscale.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:path_provider/path_provider.dart';
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await dotenv.load(fileName: ".env");
+  runApp(const MyApp());
+}
+
+class MyApp extends StatefulWidget {
+  const MyApp({super.key});
+
+  @override
+  State<MyApp> createState() => _MyAppState();
+}
+
+class _MyAppState extends State<MyApp> {
+  late final Tailscale _tsnet;
+  bool _isTailscaleReady = false;
+  late String _webUrl;
+  late String _appName;
+
+  @override
+  void initState() {
+    super.initState();
+    _webUrl = dotenv.env['WEB_URL'] ?? 'http://example.com';
+    _appName = dotenv.env['APP_NAME'] ?? 'Unnamed APP';
+    _initTailscale();
+  }
+
+  Future<void> _initTailscale() async {
+    final authKey = dotenv.env['TAILSCALE_AUTH_KEY'];
+    final hostname = dotenv.env['TAILSCALE_HOSTNAME'] ?? 'unknown';
+
+    final dir = await getApplicationDocumentsDirectory();
+    final stateDir = '${dir.path}/tailscale_state';
+
+    Tailscale.init(
+      stateDir: stateDir,
+      logLevel: TailscaleLogLevel.info,
+    );
+
+    _tsnet = Tailscale.instance;
+
+    _tsnet.onStateChange.listen((state) {
+      if (state == TailscaleNodeState.running) {
+        setState(() => _isTailscaleReady = true);
+      }
+    });
+
+    await _tsnet.up(
+      hostname: hostname,
+      authKey: authKey,
+    );
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: _appName,
+      theme: ThemeData(primarySwatch: Colors.blue),
+      home: Scaffold(
+        appBar: AppBar(title: Text(_appName)),
+        body: _isTailscaleReady
+            ? WebViewWidget(
+                controller: WebViewController()
+                  ..setJavaScriptMode(JavaScriptMode.unrestricted)
+                  ..loadRequest(Uri.parse(_webUrl)),
+              )
+            : const Center(child: CircularProgressIndicator()),
+      ),
+    );
+  }
+}
