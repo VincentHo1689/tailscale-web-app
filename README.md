@@ -11,8 +11,9 @@ Package any internal web service into a standalone Android app with built-in Tai
 
 ## Configuration
 
-- `TAILSCALE_AUTH_KEY`: Generated from the Tailscale Admin Console (must check "Reusable").
-- `WEB_URL`: Your WebUI fixed IP:Port.
+- `WEB_URL`: Your WebUI URL, such as `http://100.x.x.x:8000`. Multiple
+  comma-separated URLs are tried in order, with retries, so an alternate
+  current Tailscale IP can be provided during an address change.
 - `APP_NAME`: Display name of the application (e.g., "My App").
 - `APP_PACKAGE`: Application package name (e.g., `com.example.myapp`).
 - `TAILSCALE_HOSTNAME`: Device name displayed in Tailscale.

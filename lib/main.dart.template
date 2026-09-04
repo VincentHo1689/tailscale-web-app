@@ -1,8 +1,16 @@
+import 'dart:async';
+import 'dart:io';
+
 import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:http/http.dart' as http;
 import 'package:tailscale/tailscale.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:path_provider/path_provider.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+const _appChromeColor = Color(0xFF111827);
 
 void main() async {
   WidgetsFlutterBinding.ensureInitialized();
@@ -17,7 +25,7 @@ class MyApp extends StatefulWidget {
   State<MyApp> createState() => _MyAppState();
 }
 
-class _MyAppState extends State<MyApp> {
+class _MyAppState extends State<MyApp> with WidgetsBindingObserver {
   bool _ready = false;
   bool _checkingLogin = false;
   String _url = '';
@@ -25,10 +33,19 @@ class _MyAppState extends State<MyApp> {
   String _appPackage = 'com.tailscaleweb.app';
   Uri? _loginUrl;
   String? _error;
+  bool _loginPending = false;
+  bool _loginOpened = false;
+  bool _showLoginRetry = false;
+  StreamSubscription<NodeState>? _stateSubscription;
+  HttpServer? _proxyServer;
+  Uri? _targetUri;
+  List<Uri> _targetUris = <Uri>[];
+  Uri? _proxyUri;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _url = dotenv.env['WEB_URL'] ?? 'http://example.com';
     _appName = (dotenv.env['APP_NAME'] ?? 'My App').trim();
     _appPackage = (dotenv.env['APP_PACKAGE'] ?? 'com.tailscaleweb.app').trim();
@@ -49,13 +66,18 @@ class _MyAppState extends State<MyApp> {
       );
 
       final tsnet = Tailscale.instance;
+      _stateSubscription = tsnet.onStateChange.listen((state) {
+        if (state == NodeState.needsLogin) {
+          _captureLoginUrl(tsnet);
+        }
+      });
       final status = await _startTailscale(tsnet, hostname);
 
       if (!mounted) return;
       if (status.needsLogin) {
-        await _showLoginPage(tsnet, status);
+        await _captureLoginUrl(tsnet, initialStatus: status);
       } else if (status.isRunning) {
-        setState(() => _ready = true);
+        await _prepareWebView(tsnet);
       } else if (status.state == NodeState.needsMachineAuth) {
         setState(
           () => _error = 'This device needs approval in Tailscale admin.',
@@ -70,32 +92,102 @@ class _MyAppState extends State<MyApp> {
     }
   }
 
-  Future<void> _showLoginPage(
-    TailscaleClient tsnet,
-    TailscaleStatus initialStatus,
-  ) async {
-    var status = initialStatus;
-    if (status.authUrl == null) {
-      try {
-        await tsnet.down();
-      } catch (_) {}
-      try {
-        status = await tsnet.up(
-          hostname: dotenv.env['TAILSCALE_HOSTNAME'] ?? 'UnnamedDevice',
-        );
-      } catch (_) {}
-    }
+  Future<void> _captureLoginUrl(
+    TailscaleClient tsnet, {
+    TailscaleStatus? initialStatus,
+  }) async {
+    final status = initialStatus ?? await tsnet.status();
     if (!mounted) return;
     if (status.isRunning) {
       setState(() => _ready = true);
     } else if (status.authUrl != null) {
-      setState(() => _loginUrl = status.authUrl);
+      setState(() {
+        _loginPending = false;
+        _loginUrl = status.authUrl;
+      });
+      await _openLoginPage(status.authUrl!);
+      Future<void>.delayed(const Duration(seconds: 20), () {
+        if (mounted && !_ready) setState(() => _showLoginRetry = true);
+      });
       _waitForLogin(tsnet);
     } else {
-      setState(
-        () => _error =
-            'Tailscale needs login, but did not provide a login URL. Restart the app and try again.',
+      setState(() => _loginPending = true);
+      Future<void>.delayed(const Duration(seconds: 15), () {
+        if (mounted && !_ready && _loginUrl == null) {
+          setState(() => _showLoginRetry = true);
+        }
+      });
+      _waitForLogin(tsnet);
+    }
+  }
+
+  Future<void> _openLoginPage(Uri loginUrl) async {
+    if (_loginOpened) return;
+    _loginOpened = true;
+    final opened = await launchUrl(
+      loginUrl,
+      mode: LaunchMode.externalApplication,
+    );
+    if (!opened && mounted) {
+      setState(() => _error = 'Could not open the Tailscale login page.');
+    }
+  }
+
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && !_ready) {
+      _refreshLoginState();
+    }
+  }
+
+  Future<void> _refreshLoginState() async {
+    if (_checkingLogin || !mounted) return;
+    try {
+      final tsnet = Tailscale.instance;
+      final status = await tsnet.status();
+      if (!mounted) return;
+      if (status.isRunning) {
+        await _prepareWebView(tsnet);
+        return;
+      }
+      if (status.needsLogin && status.authUrl != null) {
+        final isNewLoginUrl = status.authUrl != _loginUrl;
+        setState(() {
+          _loginPending = false;
+          _loginUrl = status.authUrl;
+        });
+        if (isNewLoginUrl) {
+          _loginOpened = false;
+          await _openLoginPage(status.authUrl!);
+        }
+        _waitForLogin(tsnet);
+      }
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = 'Tailscale login check failed: $e');
+      }
+    }
+  }
+
+  Future<void> _restartLogin() async {
+    if (_checkingLogin) return;
+    setState(() {
+      _error = null;
+      _loginPending = true;
+      _loginUrl = null;
+      _loginOpened = false;
+      _showLoginRetry = false;
+    });
+    try {
+      final tsnet = Tailscale.instance;
+      await tsnet.down();
+      final status = await tsnet.up(
+        hostname: dotenv.env['TAILSCALE_HOSTNAME'] ?? 'UnnamedDevice',
       );
+      await _captureLoginUrl(tsnet, initialStatus: status);
+    } catch (e) {
+      if (mounted)
+        setState(() => _error = 'Tailscale login restart failed: $e');
     }
   }
 
@@ -118,23 +210,171 @@ class _MyAppState extends State<MyApp> {
     }
   }
 
+  Future<void> _prepareWebView(TailscaleClient tsnet) async {
+    if (_proxyServer != null && _proxyUri != null) return;
+    final targets = _url
+        .split(',')
+        .map((value) => Uri.tryParse(value.trim()))
+        .whereType<Uri>()
+        .where((uri) => uri.hasScheme && uri.host.isNotEmpty)
+        .toList();
+    if (targets.isEmpty) {
+      throw const FormatException('WEB_URL does not contain a valid URL.');
+    }
+    final server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    _targetUris = targets;
+    _targetUri = targets.first;
+    _proxyServer = server;
+    _proxyUri = Uri(
+      scheme: 'http',
+      host: InternetAddress.loopbackIPv4.host,
+      port: server.port,
+    );
+    server.listen((request) => _forwardRequest(request, tsnet));
+    if (mounted) {
+      setState(() {
+        _loginPending = false;
+        _loginUrl = null;
+        _ready = true;
+      });
+    }
+  }
+
+  Future<void> _forwardRequest(
+    HttpRequest request,
+    TailscaleClient tsnet,
+  ) async {
+    final target = _targetUri;
+    if (target == null) return;
+    try {
+      final body = await request.fold<List<int>>(
+        <int>[],
+        (bytes, chunk) => bytes..addAll(chunk),
+      );
+      http.StreamedResponse? response;
+      Object? lastError;
+      for (final candidate in _targetUris) {
+        final uri = candidate.replace(
+          path: request.uri.path,
+          query: request.uri.query,
+        );
+        for (var attempt = 0; attempt < 3; attempt++) {
+          try {
+            final outbound = http.Request(request.method, uri)
+              ..bodyBytes = body;
+            request.headers.forEach((name, values) {
+              if (name.toLowerCase() != 'host' &&
+                  name.toLowerCase() != 'content-length') {
+                outbound.headers[name] = values.join(',');
+              }
+            });
+            response = await tsnet.http.client
+                .send(outbound)
+                .timeout(const Duration(seconds: 12));
+            _targetUri = candidate;
+            break;
+          } catch (error) {
+            lastError = error;
+            if (attempt < 2) {
+              await Future<void>.delayed(
+                Duration(milliseconds: 300 * (attempt + 1)),
+              );
+            }
+          }
+        }
+        if (response != null) break;
+      }
+      if (response == null) {
+        throw lastError ?? const SocketException('No target responded.');
+      }
+      final streamed = await http.Response.fromStream(
+        response,
+      ).timeout(const Duration(seconds: 20));
+      request.response.statusCode = streamed.statusCode;
+      streamed.headers.forEach((name, value) {
+        if (name != 'transfer-encoding' && name != 'content-length') {
+          final headerName = name.toLowerCase();
+          if (headerName == 'location') {
+            request.response.headers.set(name, _rewriteLocation(value));
+          } else if (headerName == 'set-cookie') {
+            request.response.headers.set(name, _rewriteSetCookie(value));
+          } else {
+            request.response.headers.set(name, value);
+          }
+        }
+      });
+      request.response.contentLength = streamed.bodyBytes.length;
+      request.response.add(streamed.bodyBytes);
+      await request.response.close();
+    } catch (e) {
+      request.response
+        ..statusCode = HttpStatus.badGateway
+        ..write('Tailnet request failed: $e');
+      await request.response.close();
+    }
+  }
+
+  String _rewriteLocation(String location) {
+    final target = _targetUri;
+    final proxy = _proxyUri;
+    if (target == null || proxy == null) return location;
+    final redirected = target.resolve(location);
+    if (redirected.host != target.host || redirected.port != target.port) {
+      return location;
+    }
+    return proxy
+        .replace(
+          path: redirected.path,
+          query: redirected.query,
+          fragment: redirected.fragment,
+        )
+        .toString();
+  }
+
+  String _rewriteSetCookie(String cookie) {
+    final attributes = cookie.split(';').map((part) => part.trim());
+    final rewritten = <String>[];
+    var hasPath = false;
+    for (final attribute in attributes) {
+      final lower = attribute.toLowerCase();
+      if (lower.startsWith('domain=') ||
+          lower == 'secure' ||
+          lower == 'partitioned') {
+        continue;
+      }
+      if (lower.startsWith('samesite=none')) {
+        rewritten.add('SameSite=Lax');
+      } else {
+        rewritten.add(attribute);
+      }
+      if (lower.startsWith('path=')) hasPath = true;
+    }
+    if (!hasPath) rewritten.add('Path=/');
+    return rewritten.join('; ');
+  }
+
   Future<void> _waitForLogin(TailscaleClient tsnet) async {
     if (_checkingLogin) return;
     _checkingLogin = true;
     try {
-      while (mounted && !_ready && _loginUrl != null) {
+      while (mounted && !_ready) {
         await Future<void>.delayed(const Duration(seconds: 2));
         final status = await tsnet.status();
         if (!mounted) return;
         if (status.isRunning) {
-          setState(() {
-            _loginUrl = null;
-            _ready = true;
-          });
+          await _prepareWebView(tsnet);
           return;
+        }
+        if (status.needsLogin && status.authUrl != null && _loginUrl == null) {
+          setState(() {
+            _loginPending = false;
+            _loginUrl = status.authUrl;
+          });
+          await _openLoginPage(status.authUrl!);
         }
         if (status.state == NodeState.needsMachineAuth) {
           setState(() {
+            _loginPending = false;
             _loginUrl = null;
             _error = 'This device needs approval in Tailscale admin.';
           });
@@ -149,44 +389,56 @@ class _MyAppState extends State<MyApp> {
   }
 
   @override
-  Widget build(BuildContext context) {
-    return MaterialApp(
-      title: _appName,
-      home: Scaffold(
-        body: _error != null
-            ? Center(
-                child: Padding(
-                  padding: const EdgeInsets.all(24),
-                  child: Text(_error!, textAlign: TextAlign.center),
-                ),
-              )
-            : _loginUrl != null
-            ? _buildLoginWebView()
-            : _ready
-            ? _buildWebView()
-            : const Center(child: CircularProgressIndicator()),
-      ),
-    );
+  void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
+    _stateSubscription?.cancel();
+    _proxyServer?.close(force: true);
+    super.dispose();
   }
 
-  Widget _buildLoginWebView() {
-    return InAppWebView(
-      initialUrlRequest: URLRequest(url: WebUri(_loginUrl.toString())),
-      onLoadStop: (controller, url) => _waitForLogin(Tailscale.instance),
-      onReceivedError: (controller, request, error) {
-        if (mounted) {
-          setState(
-            () => _error =
-                'Tailscale login page failed to load: ${error.description}',
-          );
-        }
-      },
+  @override
+  Widget build(BuildContext context) {
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: const SystemUiOverlayStyle(
+        statusBarColor: _appChromeColor,
+        statusBarIconBrightness: Brightness.light,
+        statusBarBrightness: Brightness.dark,
+      ),
+      child: MaterialApp(
+        title: _appName,
+        home: Scaffold(
+          backgroundColor: _appChromeColor,
+          body: SafeArea(
+            top: true,
+            bottom: false,
+            child: _error != null
+                ? Center(
+                    child: Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Text(_error!, textAlign: TextAlign.center),
+                    ),
+                  )
+                : _loginPending || _loginUrl != null
+                ? Center(
+                    child: _showLoginRetry
+                        ? ElevatedButton(
+                            onPressed: _restartLogin,
+                            child: const Text('Retry Tailscale login'),
+                          )
+                        : const CircularProgressIndicator(),
+                  )
+                : _ready
+                ? _buildWebView()
+                : const Center(child: CircularProgressIndicator()),
+          ),
+        ),
+      ),
     );
   }
 
   Widget _buildWebView() {
     return InAppWebView(
-      initialUrlRequest: URLRequest(url: WebUri(_url)),
+      initialUrlRequest: URLRequest(url: WebUri(_proxyUri.toString())),
       onReceivedError: (controller, request, error) {
         if (mounted) {
           setState(() => _error = 'WebUI failed to load: ${error.description}');
