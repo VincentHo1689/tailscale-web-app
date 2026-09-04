@@ -1,5 +1,5 @@
 import 'package:flutter/material.dart';
-import 'package:webview_flutter/webview_flutter.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
 import 'package:tailscale/tailscale.dart';
 import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:path_provider/path_provider.dart';
@@ -18,60 +18,180 @@ class MyApp extends StatefulWidget {
 }
 
 class _MyAppState extends State<MyApp> {
-  late final Tailscale _tsnet;
-  bool _isTailscaleReady = false;
-  late String _webUrl;
-  late String _appName;
+  bool _ready = false;
+  bool _checkingLogin = false;
+  String _url = '';
+  String _appName = 'My App';
+  String _appPackage = 'com.tailscaleweb.app';
+  Uri? _loginUrl;
+  String? _error;
 
   @override
   void initState() {
     super.initState();
-    _webUrl = dotenv.env['WEB_URL'] ?? 'http://example.com';
-    _appName = dotenv.env['APP_NAME'] ?? 'Unnamed APP';
+    _url = dotenv.env['WEB_URL'] ?? 'http://example.com';
+    _appName = (dotenv.env['APP_NAME'] ?? 'My App').trim();
+    _appPackage = (dotenv.env['APP_PACKAGE'] ?? 'com.tailscaleweb.app').trim();
     _initTailscale();
   }
 
   Future<void> _initTailscale() async {
-    final authKey = dotenv.env['TAILSCALE_AUTH_KEY'];
-    final hostname = dotenv.env['TAILSCALE_HOSTNAME'] ?? 'unknown';
+    try {
+      final hostname = dotenv.env['TAILSCALE_HOSTNAME'] ?? 'UnnamedDevice';
 
-    final dir = await getApplicationDocumentsDirectory();
-    final stateDir = '${dir.path}/tailscale_state';
+      final dir = await getApplicationDocumentsDirectory();
+      final stateDir = '${dir.path}/tailscale_state';
 
-    Tailscale.init(
-      stateDir: stateDir,
-      logLevel: TailscaleLogLevel.info,
-    );
+      Tailscale.init(
+        appId: _appPackage,
+        stateDir: stateDir,
+        logLevel: TailscaleLogLevel.info,
+      );
 
-    _tsnet = Tailscale.instance;
+      final tsnet = Tailscale.instance;
+      final status = await _startTailscale(tsnet, hostname);
 
-    _tsnet.onStateChange.listen((state) {
-      if (state == TailscaleNodeState.running) {
-        setState(() => _isTailscaleReady = true);
+      if (!mounted) return;
+      if (status.needsLogin) {
+        await _showLoginPage(tsnet, status);
+      } else if (status.isRunning) {
+        setState(() => _ready = true);
+      } else if (status.state == NodeState.needsMachineAuth) {
+        setState(
+          () => _error = 'This device needs approval in Tailscale admin.',
+        );
+      } else {
+        setState(() => _error = 'Tailscale is not ready: ${status.state}.');
       }
-    });
+    } catch (e) {
+      if (mounted) {
+        setState(() => _error = 'Tailscale failed to start: $e');
+      }
+    }
+  }
 
-    await _tsnet.up(
-      hostname: hostname,
-      authKey: authKey,
-    );
+  Future<void> _showLoginPage(
+    TailscaleClient tsnet,
+    TailscaleStatus initialStatus,
+  ) async {
+    var status = initialStatus;
+    if (status.authUrl == null) {
+      try {
+        await tsnet.down();
+      } catch (_) {}
+      try {
+        status = await tsnet.up(
+          hostname: dotenv.env['TAILSCALE_HOSTNAME'] ?? 'UnnamedDevice',
+        );
+      } catch (_) {}
+    }
+    if (!mounted) return;
+    if (status.isRunning) {
+      setState(() => _ready = true);
+    } else if (status.authUrl != null) {
+      setState(() => _loginUrl = status.authUrl);
+      _waitForLogin(tsnet);
+    } else {
+      setState(
+        () => _error =
+            'Tailscale needs login, but did not provide a login URL. Restart the app and try again.',
+      );
+    }
+  }
+
+  Future<TailscaleStatus> _startTailscale(
+    TailscaleClient tsnet,
+    String hostname,
+  ) async {
+    try {
+      return await tsnet.up(hostname: hostname);
+    } catch (firstError) {
+      try {
+        await tsnet.down();
+      } catch (_) {}
+      await Future<void>.delayed(const Duration(seconds: 1));
+      try {
+        return await tsnet.up(hostname: hostname);
+      } catch (_) {
+        throw firstError;
+      }
+    }
+  }
+
+  Future<void> _waitForLogin(TailscaleClient tsnet) async {
+    if (_checkingLogin) return;
+    _checkingLogin = true;
+    try {
+      while (mounted && !_ready && _loginUrl != null) {
+        await Future<void>.delayed(const Duration(seconds: 2));
+        final status = await tsnet.status();
+        if (!mounted) return;
+        if (status.isRunning) {
+          setState(() {
+            _loginUrl = null;
+            _ready = true;
+          });
+          return;
+        }
+        if (status.state == NodeState.needsMachineAuth) {
+          setState(() {
+            _loginUrl = null;
+            _error = 'This device needs approval in Tailscale admin.';
+          });
+          return;
+        }
+      }
+    } catch (e) {
+      if (mounted) setState(() => _error = 'Tailscale login check failed: $e');
+    } finally {
+      _checkingLogin = false;
+    }
   }
 
   @override
   Widget build(BuildContext context) {
     return MaterialApp(
       title: _appName,
-      theme: ThemeData(primarySwatch: Colors.blue),
       home: Scaffold(
-        appBar: AppBar(title: Text(_appName)),
-        body: _isTailscaleReady
-            ? WebViewWidget(
-                controller: WebViewController()
-                  ..setJavaScriptMode(JavaScriptMode.unrestricted)
-                  ..loadRequest(Uri.parse(_webUrl)),
+        body: _error != null
+            ? Center(
+                child: Padding(
+                  padding: const EdgeInsets.all(24),
+                  child: Text(_error!, textAlign: TextAlign.center),
+                ),
               )
+            : _loginUrl != null
+            ? _buildLoginWebView()
+            : _ready
+            ? _buildWebView()
             : const Center(child: CircularProgressIndicator()),
       ),
+    );
+  }
+
+  Widget _buildLoginWebView() {
+    return InAppWebView(
+      initialUrlRequest: URLRequest(url: WebUri(_loginUrl.toString())),
+      onLoadStop: (controller, url) => _waitForLogin(Tailscale.instance),
+      onReceivedError: (controller, request, error) {
+        if (mounted) {
+          setState(
+            () => _error =
+                'Tailscale login page failed to load: ${error.description}',
+          );
+        }
+      },
+    );
+  }
+
+  Widget _buildWebView() {
+    return InAppWebView(
+      initialUrlRequest: URLRequest(url: WebUri(_url)),
+      onReceivedError: (controller, request, error) {
+        if (mounted) {
+          setState(() => _error = 'WebUI failed to load: ${error.description}');
+        }
+      },
     );
   }
 }

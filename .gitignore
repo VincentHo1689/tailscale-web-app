@@ -26,5 +26,9 @@ pubspec.lock
 .DS_Store
 Thumbs.db
 
+.metadata
+.flutter-plugins-dependencies
+analysis_options.yaml
+
 *.apk
 *.aab
