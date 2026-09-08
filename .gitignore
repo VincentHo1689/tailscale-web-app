@@ -1,7 +1,6 @@
 *
 
 !.gitignore
-!README.md
 !.env.example
 !main.dart.template
 !MainActivity.kt.template

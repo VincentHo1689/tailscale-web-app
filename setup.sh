@@ -58,8 +58,14 @@ sed -i.bak "s#namespace = \"[^\"]*\"#namespace = \"$escaped_package\"#" android/
 rm -f android/app/build.gradle.kts.bak
 
 if ! grep -q 'androidx.webkit:webkit' android/app/build.gradle.kts; then
-    sed -i.bak '/dependencies {/a\    implementation("androidx.webkit:webkit:1.12.1")' android/app/build.gradle.kts
-    rm -f android/app/build.gradle.kts.bak
+    if ! grep -q '^dependencies {' android/app/build.gradle.kts; then
+        echo -e "\ndependencies {\n    implementation(\"androidx.webkit:webkit:1.12.1\")\n}" >> android/app/build.gradle.kts
+    else
+        sed -i.bak '/^dependencies {/a\
+    implementation("androidx.webkit:webkit:1.12.1")
+' android/app/build.gradle.kts
+        rm -f android/app/build.gradle.kts.bak
+    fi
 fi
 
 manifest="android/app/src/main/AndroidManifest.xml"
