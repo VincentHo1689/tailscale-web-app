@@ -1,5 +1,5 @@
 name: tailscale_web_app
-description: Tailscale-powered WebView app.
+description: Reusable Android WebView app with an embedded Tailscale connection.
 publish_to: "none"
 version: 1.0.0
 
@@ -19,6 +19,7 @@ dependencies:
 dev_dependencies:
     flutter_test:
         sdk: flutter
+    flutter_lints: ^6.0.0
     flutter_launcher_icons: ^0.14.4
 
 flutter:
@@ -28,7 +29,7 @@ flutter:
 
 flutter_icons:
     android: true
-    ios: true
+    ios: false
     image_path: "icons/icon.png"
     adaptive_icon_background: "#ffffff"
     adaptive_icon_foreground: "icons/icon.png"

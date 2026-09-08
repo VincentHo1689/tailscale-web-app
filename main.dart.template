@@ -1,0 +1,467 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:io';
+import 'dart:typed_data';
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:flutter_inappwebview/flutter_inappwebview.dart';
+import 'package:path_provider/path_provider.dart';
+import 'package:tailscale/tailscale.dart';
+import 'package:url_launcher/url_launcher.dart';
+
+const _proxyChannel = MethodChannel('__APP_PACKAGE__/webview_proxy');
+
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await dotenv.load(fileName: '.env');
+  runApp(const TailscaleWebApp());
+}
+
+class TailscaleWebApp extends StatefulWidget {
+  const TailscaleWebApp({super.key});
+
+  @override
+  State<TailscaleWebApp> createState() => _TailscaleWebAppState();
+}
+
+class _TailscaleWebAppState extends State<TailscaleWebApp> {
+  TailscaleClient? _tsnet;
+  Uri? _loginUrl;
+  String? _error;
+  bool _loading = true;
+  bool _openingLogin = false;
+  bool _restartingLogin = false;
+  bool _ready = false;
+  LocalForwardProxy? _proxy;
+
+  String get _appName => dotenv.env['APP_NAME']?.trim() ?? 'Tailscale Web App';
+  String get _packageName =>
+      dotenv.env['APP_PACKAGE']?.trim() ?? 'com.example.tailscalewebapp';
+  String get _hostname =>
+      dotenv.env['TAILSCALE_HOSTNAME']?.trim() ?? 'TailscaleWebApp';
+  String get _webUrl => dotenv.env['WEB_URL']?.trim() ?? '';
+
+  @override
+  void initState() {
+    super.initState();
+    _connect();
+  }
+
+  Future<void> _connect() async {
+    try {
+      final target = Uri.tryParse(_webUrl);
+      if (target == null || !target.hasScheme || target.host.isEmpty) {
+        throw const FormatException(
+          'WEB_URL must be a complete HTTP or HTTPS URL.',
+        );
+      }
+      if (target.scheme != 'http' && target.scheme != 'https') {
+        throw const FormatException('WEB_URL must use HTTP or HTTPS.');
+      }
+
+      final directory = await getApplicationDocumentsDirectory();
+      Tailscale.init(
+        appId: _packageName,
+        stateDir: '${directory.path}/tailscale_state',
+        logLevel: TailscaleLogLevel.info,
+      );
+      final tsnet = Tailscale.instance;
+      _tsnet = tsnet;
+      final status = await tsnet.up(hostname: _hostname);
+
+      if (!mounted) return;
+      if (status.needsLogin) {
+        setState(() {
+          _loading = false;
+          _loginUrl = status.authUrl;
+        });
+        if (status.authUrl != null) {
+          await _openLogin(status.authUrl!);
+        }
+        _waitForConnection();
+      } else if (status.isRunning) {
+        await _showWebView(tsnet, target);
+      } else {
+        throw StateError('Tailscale is not ready: ${status.state}.');
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = error.toString();
+        });
+      }
+    }
+  }
+
+  Future<void> _openLogin(Uri url) async {
+    if (_openingLogin) return;
+    _openingLogin = true;
+    final opened = await launchUrl(url, mode: LaunchMode.externalApplication);
+    if (!opened && mounted) {
+      setState(() => _error = 'Could not open the Tailscale login page.');
+    }
+  }
+
+  Future<void> _waitForConnection() async {
+    final tsnet = _tsnet;
+    if (tsnet == null) return;
+    while (mounted && !_ready) {
+      await Future<void>.delayed(const Duration(seconds: 2));
+      final status = await tsnet.status();
+      if (!mounted) return;
+      if (status.isRunning) {
+        final target = Uri.parse(_webUrl);
+        await _showWebView(tsnet, target);
+        return;
+      }
+      if (status.needsLogin && status.authUrl != null) {
+        final isNewLoginUrl = status.authUrl != _loginUrl;
+        if (isNewLoginUrl) {
+          setState(() => _loginUrl = status.authUrl);
+          _openingLogin = false;
+          await _openLogin(status.authUrl!);
+        }
+      }
+      if (status.state == NodeState.needsMachineAuth) {
+        setState(() {
+          _loading = false;
+          _error = 'This device needs approval in the Tailscale admin console.';
+        });
+        return;
+      }
+    }
+  }
+
+  Future<void> _restartLogin() async {
+    if (_restartingLogin || _tsnet == null) return;
+    setState(() {
+      _error = null;
+      _loading = true;
+      _loginUrl = null;
+    });
+    _restartingLogin = true;
+    try {
+      final tsnet = _tsnet!;
+      await tsnet.down();
+      final status = await tsnet.up(hostname: _hostname);
+      if (!mounted) return;
+      if (status.isRunning) {
+        await _showWebView(tsnet, Uri.parse(_webUrl));
+      } else if (status.needsLogin && status.authUrl != null) {
+        setState(() {
+          _loading = false;
+          _loginUrl = status.authUrl;
+        });
+        _openingLogin = false;
+        await _openLogin(status.authUrl!);
+      } else {
+        throw StateError('Tailscale is not ready: ${status.state}.');
+      }
+    } catch (error) {
+      if (mounted) {
+        setState(() {
+          _loading = false;
+          _error = error.toString();
+        });
+      }
+    } finally {
+      _restartingLogin = false;
+    }
+  }
+
+  Future<void> _showWebView(TailscaleClient tsnet, Uri target) async {
+    if (_ready) return;
+    final proxy = LocalForwardProxy(tsnet);
+    await proxy.start();
+    await _proxyChannel.invokeMethod<void>('setProxy', {
+      'host': InternetAddress.loopbackIPv4.host,
+      'port': proxy.port,
+    });
+    _proxy = proxy;
+    if (!mounted) return;
+    setState(() {
+      _loading = false;
+      _loginUrl = null;
+      _ready = true;
+    });
+  }
+
+  @override
+  void dispose() {
+    _proxyChannel.invokeMethod<void>('clearProxy');
+    _proxy?.close();
+    _tsnet?.down();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: _appName,
+      debugShowCheckedModeBanner: false,
+      home: Scaffold(
+        body: SafeArea(
+          top: true,
+          bottom: false,
+          child: _ready
+              ? InAppWebView(
+                  initialUrlRequest: URLRequest(url: WebUri(_webUrl)),
+                )
+              : Center(
+                  child: _error != null
+                      ? Padding(
+                          padding: const EdgeInsets.all(24),
+                          child: Text(_error!, textAlign: TextAlign.center),
+                        )
+                      : _loginUrl != null
+                      ? Column(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            const Text(
+                              'Complete Tailscale login in your browser.',
+                            ),
+                            const SizedBox(height: 16),
+                            ElevatedButton(
+                              onPressed:
+                                  _restartingLogin ? null : _restartLogin,
+                              child: const Text('Open fresh login'),
+                            ),
+                          ],
+                        )
+                      : _loading
+                      ? const CircularProgressIndicator()
+                      : const Text('Waiting for Tailscale connection...'),
+                ),
+        ),
+      ),
+    );
+  }
+}
+
+class LocalForwardProxy {
+  LocalForwardProxy(this._tsnet);
+
+  final TailscaleClient _tsnet;
+  HttpServer? _server;
+
+  int get port => _server!.port;
+
+  Future<void> start() async {
+    _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
+    _server!.listen(_handleRequest);
+  }
+
+  Future<void> close() async {
+    await _server?.close(force: true);
+    _server = null;
+  }
+
+  Future<void> _handleRequest(HttpRequest request) async {
+    if (request.method == 'CONNECT') {
+      await _handleConnect(request);
+      return;
+    }
+    try {
+      final target = _requestTarget(request);
+      final connection = await _dial(target);
+      final body = await request.fold<List<int>>(
+        <int>[],
+        (bytes, chunk) => bytes..addAll(chunk),
+      );
+      final headers = _requestHeaders(request, target, body.length);
+      final path = target.path.isEmpty ? '/' : target.path;
+      final requestLine =
+          '${request.method} $path${target.hasQuery ? '?${target.query}' : ''} HTTP/1.1\r\n';
+      await connection.output.write(utf8.encode('$requestLine$headers\r\n'));
+      if (body.isNotEmpty) await connection.output.write(body);
+
+      final responseBytes = await connection.input
+          .expand((chunk) => chunk)
+          .toList()
+          .timeout(const Duration(seconds: 60));
+      await connection.close();
+      _writeResponse(request.response, responseBytes);
+    } catch (error) {
+      request.response
+        ..statusCode = HttpStatus.badGateway
+        ..write('Tailscale proxy error: $error');
+      await request.response.close();
+    }
+  }
+
+  Future<void> _handleConnect(HttpRequest request) async {
+    Socket? socket;
+    TailscaleConnection? connection;
+    var responseDetached = false;
+    try {
+      final target = _authorityTarget(request.uri);
+      connection = await _dial(target);
+      socket = await request.response.detachSocket();
+      responseDetached = true;
+      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
+      final remote = connection;
+      final local = socket;
+      final localToRemote = local.listen(
+        (bytes) => remote.output.write(bytes),
+        onDone: remote.output.close,
+        cancelOnError: true,
+      );
+      final remoteToLocal = remote.input.listen(
+        local.add,
+        onDone: local.close,
+        cancelOnError: true,
+      );
+      await Future.any<void>([local.done, remote.done]);
+      await localToRemote.cancel();
+      await remoteToLocal.cancel();
+    } catch (error) {
+      await connection?.abort();
+      await socket?.close();
+      if (!responseDetached) {
+        request.response
+          ..statusCode = HttpStatus.badGateway
+          ..write('Tailscale tunnel error: $error');
+        await request.response.close();
+      }
+    }
+  }
+
+  Uri _requestTarget(HttpRequest request) {
+    if (request.uri.hasScheme && request.uri.host.isNotEmpty) {
+      return request.uri;
+    }
+    final host = request.headers.value('host');
+    if (host == null) {
+      throw const FormatException('Proxy request has no Host header.');
+    }
+    return Uri.parse(
+      'http://$host${request.uri.path.isEmpty ? '/' : request.uri}',
+    );
+  }
+
+  Uri _authorityTarget(Uri uri) {
+    final authority = uri.toString();
+    final separator = authority.lastIndexOf(':');
+    if (separator <= 0) throw const FormatException('Invalid CONNECT target.');
+    return Uri.parse(
+      'https://${authority.substring(0, separator)}:${authority.substring(separator + 1)}',
+    );
+  }
+
+  Future<TailscaleConnection> _dial(Uri target) {
+    return _tsnet.tcp.dial(
+      target.host,
+      target.hasPort
+          ? target.port
+          : target.scheme == 'https'
+          ? 443
+          : 80,
+      timeout: const Duration(seconds: 15),
+    );
+  }
+
+  String _requestHeaders(HttpRequest request, Uri target, int bodyLength) {
+    const hopByHop = <String>{
+      'connection',
+      'content-length',
+      'host',
+      'keep-alive',
+      'proxy-connection',
+      'te',
+      'trailers',
+      'transfer-encoding',
+      'upgrade',
+    };
+    final lines = <String>[];
+    request.headers.forEach((name, values) {
+      if (!hopByHop.contains(name.toLowerCase())) {
+        lines.add('$name: ${values.join(',')}');
+      }
+    });
+    lines
+      ..add(
+        'Host: ${target.hasPort ? '${target.host}:${target.port}' : target.host}',
+      )
+      ..add('Content-Length: $bodyLength')
+      ..add('Connection: close');
+    return '${lines.join('\r\n')}\r\n';
+  }
+
+  void _writeResponse(HttpResponse response, List<int> bytes) {
+    final separator = _headerEnd(bytes);
+    if (separator < 0) {
+      throw const FormatException('Invalid upstream response.');
+    }
+    final headerLines = utf8.decode(bytes.sublist(0, separator)).split('\r\n');
+    final status = headerLines.first.split(' ');
+    response.statusCode = int.parse(status[1]);
+    var chunked = false;
+    for (final line in headerLines.skip(1)) {
+      final colon = line.indexOf(':');
+      if (colon > 0) {
+        final name = line.substring(0, colon);
+        final value = line.substring(colon + 1).trim();
+        final lowerName = name.toLowerCase();
+        if (lowerName == 'transfer-encoding') {
+          chunked = value.toLowerCase().contains('chunked');
+        } else if (lowerName != 'content-length' && lowerName != 'connection') {
+          if (lowerName == 'set-cookie') {
+            response.headers.add(name, value);
+          } else {
+            response.headers.set(name, value);
+          }
+        }
+      }
+    }
+    final body = chunked
+        ? _decodeChunked(bytes.sublist(separator + 4))
+        : bytes.sublist(separator + 4);
+    response.contentLength = body.length;
+    response.add(body);
+    response.close();
+  }
+
+  List<int> _decodeChunked(List<int> bytes) {
+    final output = BytesBuilder();
+    var offset = 0;
+    while (offset < bytes.length) {
+      final lineEnd = _indexOf(bytes, const [13, 10], offset);
+      if (lineEnd < 0) throw const FormatException('Invalid chunked response.');
+      final size = int.tryParse(
+        utf8.decode(bytes.sublist(offset, lineEnd)).split(';').first,
+        radix: 16,
+      );
+      if (size == null) throw const FormatException('Invalid chunk size.');
+      if (size == 0) break;
+      final bodyStart = lineEnd + 2;
+      final bodyEnd = bodyStart + size;
+      if (bodyEnd + 2 > bytes.length) {
+        throw const FormatException('Incomplete chunked response.');
+      }
+      output.add(bytes.sublist(bodyStart, bodyEnd));
+      offset = bodyEnd + 2;
+    }
+    return output.takeBytes();
+  }
+
+  int _headerEnd(List<int> bytes) {
+    return _indexOf(bytes, const [13, 10, 13, 10]);
+  }
+
+  int _indexOf(List<int> bytes, List<int> needle, [int start = 0]) {
+    for (var index = start; index <= bytes.length - needle.length; index++) {
+      var matches = true;
+      for (var offset = 0; offset < needle.length; offset++) {
+        if (bytes[index + offset] != needle[offset]) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) return index;
+    }
+    return -1;
+  }
+}

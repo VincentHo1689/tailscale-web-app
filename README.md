@@ -1,25 +1,55 @@
-# Tailscale Web App
+# Tailscale Web App Template
 
-Package any internal web service into a standalone Android app with built-in Tailscale connectivity—without interfering with the system VPN.
+This repository intentionally contains only the templates and scripts needed to generate the app. The Flutter and Android project files are created locally by `setup.sh` and are ignored by Git.
 
-## Usage
+## Requirements
 
-1. Edit the `.env` file (copied from `.env.example`).
-2. Replace `icons/icon.png` with your 1024x1024 icon (optional).
-3. Run `./setup.sh` to initialize the Flutter project.
-4. Run `./build_app.sh` to generate the APK.
+Install:
 
-## Configuration
+- Flutter SDK
+- Go SDK
+- Android SDK and an Android device or emulator
 
-- `WEB_URL`: Your WebUI URL, such as `http://100.x.x.x:8000`. Multiple
-  comma-separated URLs are tried in order, with retries, so an alternate
-  current Tailscale IP can be provided during an address change.
-- `APP_NAME`: Display name of the application (e.g., "My App").
-- `APP_PACKAGE`: Application package name (e.g., `com.example.myapp`).
-- `TAILSCALE_HOSTNAME`: Device name displayed in Tailscale.
+## Setup
 
-## Notes
+1. Clone this repository.
+2. Run `./setup.sh`.
+3. The first run creates `.env` from `.env.example` and stops.
+4. Edit `.env` with your WebUI and app settings.
+5. Run `./setup.sh` again.
+6. Run `./build_app.sh`.
 
-- Internet connection is required on the first run to complete Tailscale authentication.
-- Saved login state will be reused automatically afterward.
-- Does not affect other VPNs on the device (e.g., Clash, Surfshark).
+The release APK is generated at:
+
+`build/app/outputs/flutter-apk/app-release.apk`
+
+## `.env` settings
+
+```dotenv
+WEB_URL=http://100.100.100.100:1234
+APP_NAME=My App
+APP_PACKAGE=com.example.myapp
+TAILSCALE_HOSTNAME=MyApp
+```
+
+`APP_PACKAGE` must be a valid Android package name. `APP_NAME` is the displayed app name, and `TAILSCALE_HOSTNAME` is the name of this app's separate embedded `tsnet` node.
+
+## Runtime
+
+The app starts its own embedded Tailscale node. It does not use the Tailscale app installed on the device and does not create a system VPN. If authentication is required, the Tailscale Auth URL opens in the system browser. After authentication, the configured `WEB_URL` opens in the full-screen WebView.
+
+The WebView keeps the configured URL as its origin and uses the embedded Tailscale connection for transport, avoiding artificial CORS, redirect, and cookie rewriting.
+
+## Repository contents
+
+The only application files intended for Git are:
+
+- `.env.example`
+- `main.dart.template`
+- `MainActivity.kt.template`
+- `pubspec.yaml.template`
+- `README.md`
+- `setup.sh`
+- `build_app.sh`
+- `icons/icon.png`
+- `.gitignore`

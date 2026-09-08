@@ -1,44 +1,68 @@
 #!/bin/bash
 set -e
 
-if ! command -v flutter &> /dev/null; then
-    echo "ERROR: Flutter not found. Please install Flutter."
+if ! command -v flutter >/dev/null 2>&1; then
+    echo "ERROR: Flutter SDK was not found. Install Flutter and try again."
     exit 1
 fi
 
-if ! command -v go &> /dev/null; then
-    echo "ERROR: Go not found. Please install Go 1.26+ (brew install go / apt install golang-go / etc.)"
+if ! command -v go >/dev/null 2>&1; then
+    echo "ERROR: Go was not found. Install Go and try again."
     exit 1
 fi
 
 if [ ! -f ".env" ]; then
     cp .env.example .env
-    echo "ERROR: .env file not found. Created one from .env.example. Please edit it and rerun."
+    echo "Created .env from .env.example. Edit it, then run ./setup.sh again."
     exit 1
 fi
 
+set -a
 source .env
+set +a
 
-if [ -z "$WEB_URL" ]; then
-    echo "ERROR: Missing WEB_URL in .env."
+for value in WEB_URL APP_NAME APP_PACKAGE TAILSCALE_HOSTNAME; do
+    if [ -z "${!value:-}" ]; then
+        echo "ERROR: Missing $value in .env."
+        exit 1
+    fi
+done
+
+if [[ ! "$APP_PACKAGE" =~ ^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)+$ ]]; then
+    echo "ERROR: APP_PACKAGE must look like com.example.myapp."
     exit 1
 fi
 
-echo "Creating Flutter project: $APP_NAME ($APP_PACKAGE)"
-project_name=$(echo $APP_NAME | tr '[:upper:]' '[:lower:]' | sed 's/ //g')
-org=$(echo $APP_PACKAGE | cut -d'.' -f1,2)
-flutter create --org $org --project-name $project_name .
+project_name="${APP_PACKAGE##*.}"
+org="${APP_PACKAGE%.*}"
+escaped_package=$(printf '%s' "$APP_PACKAGE" | sed 's/[\/&]/\\&/g')
+escaped_app_name=$(printf '%s' "$APP_NAME" | sed 's/[\/&]/\\&/g')
 
-sed "s/{{PROJECT_NAME}}/$project_name/g" pubspec.yaml.template > pubspec.yaml
+flutter create --platforms=android --org "$org" --project-name "$project_name" .
 
-flutter pub add tailscale flutter_dotenv path_provider flutter_inappwebview url_launcher
-flutter pub add --dev flutter_launcher_icons
+cp pubspec.yaml.template pubspec.yaml
+cp main.dart.template lib/main.dart
+rm -rf test
 
-flutter pub get
+main_activity=$(find android/app/src/main/kotlin -name MainActivity.kt -type f -print -quit)
+if [ -z "$main_activity" ]; then
+    echo "ERROR: Flutter did not create MainActivity.kt."
+    exit 1
+fi
+sed "s/__APP_PACKAGE__/$escaped_package/g" MainActivity.kt.template > "$main_activity"
+sed -i.bak "s/__APP_PACKAGE__/$escaped_package/g" lib/main.dart
+rm -f lib/main.dart.bak
+
+sed -i.bak "s#applicationId = \"[^\"]*\"#applicationId = \"$escaped_package\"#" android/app/build.gradle.kts
+sed -i.bak "s#namespace = \"[^\"]*\"#namespace = \"$escaped_package\"#" android/app/build.gradle.kts
+rm -f android/app/build.gradle.kts.bak
+
+if ! grep -q 'androidx.webkit:webkit' android/app/build.gradle.kts; then
+    sed -i.bak '/dependencies {/a\    implementation("androidx.webkit:webkit:1.12.1")' android/app/build.gradle.kts
+    rm -f android/app/build.gradle.kts.bak
+fi
 
 manifest="android/app/src/main/AndroidManifest.xml"
-app_name="${APP_NAME:-My App}"
-escaped_app_name=$(printf '%s' "$app_name" | sed 's/[\/&]/\\&/g')
 sed -i.bak "s#android:label=\"[^\"]*\"#android:label=\"$escaped_app_name\"#" "$manifest"
 rm -f "$manifest.bak"
 if ! grep -q 'android.permission.INTERNET' "$manifest"; then
@@ -51,10 +75,7 @@ if ! grep -q 'android:usesCleartextTraffic="true"' "$manifest"; then
     rm -f "$manifest.bak"
 fi
 
-if [ -f "icons/icon.png" ]; then
-    flutter pub run flutter_launcher_icons:main
-else
-    echo "WARNING: icons/icon.png not found, using default icon."
-fi
+flutter pub get
+flutter pub run flutter_launcher_icons:main
 
-echo "Initialization complete! Now run ./build_app.sh"
+echo "Setup complete. Run ./build_app.sh to create the APK."

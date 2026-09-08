@@ -1,0 +1,54 @@
+package __APP_PACKAGE__
+
+import android.os.Build
+import android.os.Bundle
+import android.webkit.WebView
+import androidx.webkit.ProxyConfig
+import androidx.webkit.ProxyController
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.plugin.common.MethodChannel
+import java.util.concurrent.Executors
+
+class MainActivity : FlutterActivity() {
+    private val executor = Executors.newSingleThreadExecutor()
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.KITKAT) {
+            WebView.setWebContentsDebuggingEnabled(true)
+        }
+        super.onCreate(savedInstanceState)
+
+        MethodChannel(
+            flutterEngine!!.dartExecutor.binaryMessenger,
+            "__APP_PACKAGE__/webview_proxy",
+        ).setMethodCallHandler { call, result ->
+            when (call.method) {
+                "setProxy" -> {
+                    val host = call.argument<String>("host") ?: "127.0.0.1"
+                    val port = call.argument<Int>("port") ?: 0
+                    if (port !in 1..65535) {
+                        result.error("INVALID_PORT", "Invalid proxy port", null)
+                        return@setMethodCallHandler
+                    }
+                    val config = ProxyConfig.Builder()
+                        .addProxyRule("http://$host:$port")
+                        .build()
+                    ProxyController.getInstance().setProxyOverride(
+                        config,
+                        executor,
+                    ) { runOnUiThread { result.success(null) } }
+                }
+                "clearProxy" -> ProxyController.getInstance().clearProxyOverride(
+                    executor,
+                ) { runOnUiThread { result.success(null) } }
+                else -> result.notImplemented()
+            }
+        }
+    }
+
+    override fun onDestroy() {
+        ProxyController.getInstance().clearProxyOverride(executor) {}
+        executor.shutdown()
+        super.onDestroy()
+    }
+}
