@@ -35,6 +35,15 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
   bool _restartingLogin = false;
   bool _ready = false;
   LocalForwardProxy? _proxy;
+  InAppWebViewController? _webController;
+  StreamSubscription<NodeState>? _stateSub;
+  Timer? _reloadTimer;
+  int _reloadAttempts = 0;
+  bool _loadFailed = false;
+  bool _tsConnected = false;
+
+  Color _statusBarColor = Colors.black;
+  Brightness _statusBarIconBrightness = Brightness.light;
 
   String get _appName => dotenv.env['APP_NAME']?.trim() ?? 'Tailscale Web App';
   String get _packageName =>
@@ -46,6 +55,22 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
   @override
   void initState() {
     super.initState();
+    final statusBarHex = dotenv.env['STATUS_BAR_COLOR'];
+    if (statusBarHex != null && statusBarHex.isNotEmpty) {
+      _statusBarColor = _hexToColor(statusBarHex);
+      _statusBarIconBrightness = _statusBarColor.computeLuminance() > 0.5
+          ? Brightness.dark
+          : Brightness.light;
+    }
+    SystemChrome.setSystemUIOverlayStyle(
+      SystemUiOverlayStyle(
+        statusBarColor: _statusBarColor,
+        statusBarIconBrightness: _statusBarIconBrightness,
+        statusBarBrightness: _statusBarIconBrightness == Brightness.light
+            ? Brightness.dark
+            : Brightness.light,
+      ),
+    );
     _connect();
   }
 
@@ -69,6 +94,7 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
       );
       final tsnet = Tailscale.instance;
       _tsnet = tsnet;
+      _stateSub = tsnet.onStateChange.listen(_onTailscaleState);
       final status = await tsnet.up(hostname: _hostname);
 
       if (!mounted) return;
@@ -94,6 +120,12 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
         });
       }
     }
+  }
+
+  Color _hexToColor(String hex) {
+    hex = hex.replaceAll('#', '');
+    if (hex.length == 6) hex = 'FF$hex';
+    return Color(int.parse(hex, radix: 16));
   }
 
   Future<void> _openLogin(Uri url) async {
@@ -133,6 +165,30 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
         return;
       }
     }
+  }
+
+  void _onTailscaleState(NodeState state) {
+    final connected = state == NodeState.running;
+    final becameConnected = connected && !_tsConnected;
+    _tsConnected = connected;
+    if (becameConnected) _reloadWebView();
+  }
+
+  void _reloadWebView() {
+    _reloadAttempts = 0;
+    _reloadTimer?.cancel();
+    _reloadTimer = null;
+    _webController?.reload();
+  }
+
+  void _scheduleReload() {
+    if (_reloadTimer?.isActive ?? false) return;
+    final seconds = 1 << _reloadAttempts.clamp(0, 4);
+    if (_reloadAttempts < 4) _reloadAttempts++;
+    _reloadTimer = Timer(Duration(seconds: seconds), () {
+      _reloadTimer = null;
+      _webController?.reload();
+    });
   }
 
   Future<void> _restartLogin() async {
@@ -191,6 +247,8 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
 
   @override
   void dispose() {
+    _stateSub?.cancel();
+    _reloadTimer?.cancel();
     _proxyChannel.invokeMethod<void>('clearProxy');
     _proxy?.close();
     _tsnet?.down();
@@ -199,42 +257,72 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
 
   @override
   Widget build(BuildContext context) {
-    return MaterialApp(
-      title: _appName,
-      debugShowCheckedModeBanner: false,
-      home: Scaffold(
-        body: SafeArea(
-          top: true,
-          bottom: false,
-          child: _ready
-              ? InAppWebView(
-                  initialUrlRequest: URLRequest(url: WebUri(_webUrl)),
-                )
-              : Center(
-                  child: _error != null
-                      ? Padding(
-                          padding: const EdgeInsets.all(24),
-                          child: Text(_error!, textAlign: TextAlign.center),
-                        )
-                      : _loginUrl != null
-                      ? Column(
-                          mainAxisSize: MainAxisSize.min,
-                          children: [
-                            const Text(
-                              'Complete Tailscale login in your browser.',
-                            ),
-                            const SizedBox(height: 16),
-                            ElevatedButton(
-                              onPressed:
-                                  _restartingLogin ? null : _restartLogin,
-                              child: const Text('Open fresh login'),
-                            ),
-                          ],
-                        )
-                      : _loading
-                      ? const CircularProgressIndicator()
-                      : const Text('Waiting for Tailscale connection...'),
-                ),
+    return AnnotatedRegion<SystemUiOverlayStyle>(
+      value: SystemUiOverlayStyle(
+        statusBarColor: _statusBarColor,
+        statusBarIconBrightness: _statusBarIconBrightness,
+        statusBarBrightness: _statusBarIconBrightness == Brightness.light
+            ? Brightness.dark
+            : Brightness.light,
+      ),
+      child: MaterialApp(
+        title: _appName,
+        debugShowCheckedModeBanner: false,
+        home: Scaffold(
+          backgroundColor: _statusBarColor,
+          body: SafeArea(
+            top: true,
+            bottom: false,
+            child: _ready
+                ? InAppWebView(
+                    initialUrlRequest: URLRequest(url: WebUri(_webUrl)),
+                    onWebViewCreated: (controller) =>
+                        _webController = controller,
+                    onLoadStart: (controller, url) => _loadFailed = false,
+                    onLoadStop: (controller, url) {
+                      if (!_loadFailed) _reloadAttempts = 0;
+                    },
+                    onReceivedError: (controller, request, error) {
+                      if (request.isForMainFrame == true) {
+                        _loadFailed = true;
+                        _scheduleReload();
+                      }
+                    },
+                    onReceivedHttpError: (controller, request, response) {
+                      if (request.isForMainFrame == true &&
+                          (response.statusCode ?? 0) >= 500) {
+                        _loadFailed = true;
+                        _scheduleReload();
+                      }
+                    },
+                  )
+                : Center(
+                    child: _error != null
+                        ? Padding(
+                            padding: const EdgeInsets.all(24),
+                            child: Text(_error!, textAlign: TextAlign.center),
+                          )
+                        : _loginUrl != null
+                        ? Column(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              const Text(
+                                'Complete Tailscale login in your browser.',
+                              ),
+                              const SizedBox(height: 16),
+                              ElevatedButton(
+                                onPressed: _restartingLogin
+                                    ? null
+                                    : _restartLogin,
+                                child: const Text('Open fresh login'),
+                              ),
+                            ],
+                          )
+                        : _loading
+                        ? const CircularProgressIndicator()
+                        : const Text('Waiting for Tailscale connection...'),
+                  ),
+          ),
         ),
       ),
     );

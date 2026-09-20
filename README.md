@@ -30,6 +30,7 @@ WEB_URL=http://100.100.100.100:1234
 APP_NAME=My App
 APP_PACKAGE=com.example.myapp
 TAILSCALE_HOSTNAME=MyApp
+STATUS_BAR_COLOR="#FFFFFF"
 ```
 
 `APP_PACKAGE` must be a valid Android package name. `APP_NAME` is the displayed app name, and `TAILSCALE_HOSTNAME` is the name of this app's separate embedded `tsnet` node.
