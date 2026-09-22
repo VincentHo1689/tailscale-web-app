@@ -82,6 +82,6 @@ if ! grep -q 'android:usesCleartextTraffic="true"' "$manifest"; then
 fi
 
 flutter pub get
-flutter pub run flutter_launcher_icons:main
+#flutter pub run flutter_launcher_icons:main
 
 echo "Setup complete. Run ./build_app.sh to create the APK."

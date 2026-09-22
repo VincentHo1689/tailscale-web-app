@@ -38,9 +38,12 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
   InAppWebViewController? _webController;
   StreamSubscription<NodeState>? _stateSub;
   Timer? _reloadTimer;
+  Timer? _watchdog;
   int _reloadAttempts = 0;
-  bool _loadFailed = false;
+  DateTime? _lastReloadAt;
   bool _tsConnected = false;
+  bool _pageReady = false;
+  bool _loadErrored = false;
 
   Color _statusBarColor = Colors.black;
   Brightness _statusBarIconBrightness = Brightness.light;
@@ -171,23 +174,37 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
     final connected = state == NodeState.running;
     final becameConnected = connected && !_tsConnected;
     _tsConnected = connected;
-    if (becameConnected) _reloadWebView();
+    if (!becameConnected || !_ready) return;
+    final last = _lastReloadAt;
+    if (last != null &&
+        DateTime.now().difference(last) < const Duration(seconds: 10)) {
+      return;
+    }
+    _reloadAttempts = 0;
+    _pageReady = false;
+    if (mounted) setState(() {});
+    _scheduleReload();
   }
 
-  void _reloadWebView() {
-    _reloadAttempts = 0;
-    _reloadTimer?.cancel();
-    _reloadTimer = null;
-    _webController?.reload();
+  void _startWatchdog() {
+    _watchdog?.cancel();
+    _watchdog = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!_pageReady && !(_reloadTimer?.isActive ?? false)) {
+        _scheduleReload();
+      }
+    });
   }
 
   void _scheduleReload() {
     if (_reloadTimer?.isActive ?? false) return;
-    final seconds = 1 << _reloadAttempts.clamp(0, 4);
-    if (_reloadAttempts < 4) _reloadAttempts++;
+    final seconds = _reloadAttempts >= 5 ? 30 : 1 << _reloadAttempts;
+    _reloadAttempts++;
     _reloadTimer = Timer(Duration(seconds: seconds), () {
       _reloadTimer = null;
-      _webController?.reload();
+      _lastReloadAt = DateTime.now();
+      _webController?.loadUrl(
+        urlRequest: URLRequest(url: WebUri(_webUrl)),
+      );
     });
   }
 
@@ -249,6 +266,7 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
   void dispose() {
     _stateSub?.cancel();
     _reloadTimer?.cancel();
+    _watchdog?.cancel();
     _proxyChannel.invokeMethod<void>('clearProxy');
     _proxy?.close();
     _tsnet?.down();
@@ -274,27 +292,50 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
             top: true,
             bottom: false,
             child: _ready
-                ? InAppWebView(
-                    initialUrlRequest: URLRequest(url: WebUri(_webUrl)),
-                    onWebViewCreated: (controller) =>
-                        _webController = controller,
-                    onLoadStart: (controller, url) => _loadFailed = false,
-                    onLoadStop: (controller, url) {
-                      if (!_loadFailed) _reloadAttempts = 0;
-                    },
-                    onReceivedError: (controller, request, error) {
-                      if (request.isForMainFrame == true) {
-                        _loadFailed = true;
-                        _scheduleReload();
-                      }
-                    },
-                    onReceivedHttpError: (controller, request, response) {
-                      if (request.isForMainFrame == true &&
-                          (response.statusCode ?? 0) >= 500) {
-                        _loadFailed = true;
-                        _scheduleReload();
-                      }
-                    },
+                ? Stack(
+                    children: [
+                      InAppWebView(
+                        initialUrlRequest: URLRequest(url: WebUri(_webUrl)),
+                        onWebViewCreated: (controller) {
+                          _webController = controller;
+                          _startWatchdog();
+                        },
+                        onLoadStart: (controller, url) => _loadErrored = false,
+                        onLoadStop: (controller, url) {
+                          if (_loadErrored) return;
+                          _reloadAttempts = 0;
+                          if (!_pageReady && mounted) {
+                            setState(() => _pageReady = true);
+                          }
+                        },
+                        onReceivedError: (controller, request, error) {
+                          if (request.isForMainFrame != false &&
+                              !error.description
+                                  .toLowerCase()
+                                  .contains('abort')) {
+                            _loadErrored = true;
+                            _scheduleReload();
+                          }
+                        },
+                        onReceivedHttpError:
+                            (controller, request, response) {
+                              if (request.isForMainFrame != false &&
+                                  (response.statusCode ?? 0) >= 500) {
+                                _loadErrored = true;
+                                _scheduleReload();
+                              }
+                            },
+                      ),
+                      if (!_pageReady)
+                        Positioned.fill(
+                          child: Container(
+                            color: _statusBarColor,
+                            child: const Center(
+                              child: CircularProgressIndicator(),
+                            ),
+                          ),
+                        ),
+                    ],
                   )
                 : Center(
                     child: _error != null
@@ -352,9 +393,11 @@ class LocalForwardProxy {
       await _handleConnect(request);
       return;
     }
+    TailscaleConnection? connection;
     try {
       final target = _requestTarget(request);
-      final connection = await _dial(target);
+      final conn = await _dial(target);
+      connection = conn;
       final body = await request.fold<List<int>>(
         <int>[],
         (bytes, chunk) => bytes..addAll(chunk),
@@ -363,16 +406,18 @@ class LocalForwardProxy {
       final path = target.path.isEmpty ? '/' : target.path;
       final requestLine =
           '${request.method} $path${target.hasQuery ? '?${target.query}' : ''} HTTP/1.1\r\n';
-      await connection.output.write(utf8.encode('$requestLine$headers\r\n'));
-      if (body.isNotEmpty) await connection.output.write(body);
+      await conn.output.write(utf8.encode('$requestLine$headers\r\n'));
+      if (body.isNotEmpty) await conn.output.write(body);
 
-      final responseBytes = await connection.input
+      final responseBytes = await conn.input
           .expand((chunk) => chunk)
-          .toList()
-          .timeout(const Duration(seconds: 60));
-      await connection.close();
+          .timeout(const Duration(seconds: 15))
+          .toList();
+      await conn.close();
+      connection = null;
       _writeResponse(request.response, responseBytes);
     } catch (error) {
+      await connection?.close();
       request.response
         ..statusCode = HttpStatus.badGateway
         ..write('Tailscale proxy error: $error');
