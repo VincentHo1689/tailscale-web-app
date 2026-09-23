@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
-import 'dart:typed_data';
 
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -44,6 +43,7 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
   bool _tsConnected = false;
   bool _pageReady = false;
   bool _loadErrored = false;
+  PullToRefreshController? _pullToRefresh;
 
   Color _statusBarColor = Colors.black;
   Brightness _statusBarIconBrightness = Brightness.light;
@@ -73,6 +73,10 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
             ? Brightness.dark
             : Brightness.light,
       ),
+    );
+    _pullToRefresh = PullToRefreshController(
+      settings: PullToRefreshSettings(color: _statusBarColor),
+      onRefresh: _reloadFromPull,
     );
     _connect();
   }
@@ -186,6 +190,14 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
     _scheduleReload();
   }
 
+  void _reloadFromPull() {
+    _reloadAttempts = 0;
+    _loadErrored = false;
+    if (mounted) setState(() => _pageReady = false);
+    _webController?.loadUrl(urlRequest: URLRequest(url: WebUri(_webUrl)));
+    _pullToRefresh?.endRefreshing();
+  }
+
   void _startWatchdog() {
     _watchdog?.cancel();
     _watchdog = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -267,6 +279,7 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
     _stateSub?.cancel();
     _reloadTimer?.cancel();
     _watchdog?.cancel();
+    _pullToRefresh?.dispose();
     _proxyChannel.invokeMethod<void>('clearProxy');
     _proxy?.close();
     _tsnet?.down();
@@ -296,12 +309,14 @@ class _TailscaleWebAppState extends State<TailscaleWebApp> {
                     children: [
                       InAppWebView(
                         initialUrlRequest: URLRequest(url: WebUri(_webUrl)),
+                        pullToRefreshController: _pullToRefresh,
                         onWebViewCreated: (controller) {
                           _webController = controller;
                           _startWatchdog();
                         },
                         onLoadStart: (controller, url) => _loadErrored = false,
                         onLoadStop: (controller, url) {
+                          _pullToRefresh?.endRefreshing();
                           if (_loadErrored) return;
                           _reloadAttempts = 0;
                           if (!_pageReady && mounted) {
@@ -374,114 +389,195 @@ class LocalForwardProxy {
   LocalForwardProxy(this._tsnet);
 
   final TailscaleClient _tsnet;
-  HttpServer? _server;
+  ServerSocket? _server;
 
   int get port => _server!.port;
 
   Future<void> start() async {
-    _server = await HttpServer.bind(InternetAddress.loopbackIPv4, 0);
-    _server!.listen(_handleRequest);
+    _server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    _server!.listen(_handleClient);
   }
 
   Future<void> close() async {
-    await _server?.close(force: true);
+    await _server?.close();
     _server = null;
   }
 
-  Future<void> _handleRequest(HttpRequest request) async {
-    if (request.method == 'CONNECT') {
-      await _handleConnect(request);
-      return;
-    }
-    TailscaleConnection? connection;
-    try {
-      final target = _requestTarget(request);
-      final conn = await _dial(target);
-      connection = conn;
-      final body = await request.fold<List<int>>(
-        <int>[],
-        (bytes, chunk) => bytes..addAll(chunk),
-      );
-      final headers = _requestHeaders(request, target, body.length);
-      final path = target.path.isEmpty ? '/' : target.path;
-      final requestLine =
-          '${request.method} $path${target.hasQuery ? '?${target.query}' : ''} HTTP/1.1\r\n';
-      await conn.output.write(utf8.encode('$requestLine$headers\r\n'));
-      if (body.isNotEmpty) await conn.output.write(body);
+  static const _maxHeader = 64 * 1024;
 
-      final responseBytes = await conn.input
-          .expand((chunk) => chunk)
-          .timeout(const Duration(seconds: 15))
-          .toList();
-      await conn.close();
-      connection = null;
-      _writeResponse(request.response, responseBytes);
+  /// Raw L4 tunnel: parse only the request line, forward every other byte
+  /// untouched. Never hands a CONNECT authority to Dart's Uri parser, which
+  /// rejects IP authorities like `100.64.64.2:8888`.
+  Future<void> _handleClient(Socket client) async {
+    final clientIn = StreamController<List<int>>();
+    final headReady = Completer<List<int>>();
+    var head = <int>[];
+    var readingHead = true;
+    late StreamSubscription<Uint8List> sub;
+    sub = client.listen(
+      (chunk) {
+        if (readingHead) {
+          head.addAll(chunk);
+          final end = _indexOf(head, const [13, 10, 13, 10]);
+          if (end < 0) {
+            if (head.length > _maxHeader) {
+              readingHead = false;
+              if (!headReady.isCompleted) {
+                headReady.completeError('Request header too large.');
+              }
+              client.destroy();
+            }
+            return;
+          }
+          readingHead = false;
+          final block = head.sublist(0, end + 4);
+          final rest = head.sublist(end + 4);
+          if (rest.isNotEmpty) clientIn.add(rest);
+          if (!headReady.isCompleted) headReady.complete(block);
+          return;
+        }
+        clientIn.add(chunk);
+      },
+      onError: (_) {
+        if (!headReady.isCompleted) headReady.completeError('Client error.');
+      },
+      onDone: () {
+        if (!headReady.isCompleted) headReady.completeError('Client closed.');
+        if (!clientIn.isClosed) clientIn.close();
+      },
+    );
+
+    TailscaleConnection? conn;
+    var committed = false;
+    try {
+      final block = await headReady.future.timeout(
+        const Duration(seconds: 30),
+        onTimeout: () =>
+            throw TimeoutException('Request header timeout.'),
+      );
+      final lineEnd = _indexOf(block, const [13, 10]);
+      if (lineEnd < 0) throw const FormatException('Missing request line.');
+      final requestLine = latin1.decode(block.sublist(0, lineEnd));
+      final first = requestLine.indexOf(' ');
+      final last = requestLine.lastIndexOf(' ');
+      if (first <= 0 || last <= first) {
+        throw const FormatException('Malformed request line.');
+      }
+      final method = requestLine.substring(0, first);
+      final target = requestLine.substring(first + 1, last);
+      final version = requestLine.substring(last + 1);
+      final headers = latin1
+          .decode(block.sublist(lineEnd + 2, block.length - 2))
+          .split('\r\n');
+
+      final isConnect = method == 'CONNECT';
+      final dest = isConnect ? _authority(target) : _target(target, headers);
+      final upstream = await _dial(dest);
+      conn = upstream;
+      committed = true;
+      if (isConnect) {
+        client.add('HTTP/1.1 200 Connection Established\r\n\r\n'.codeUnits);
+      } else {
+        upstream.output.write(
+          utf8.encode(_originHead(method, version, headers, dest)),
+        );
+      }
+
+      final toRemote = clientIn.stream.listen(
+        (bytes) => upstream.output.write(bytes),
+        onDone: upstream.output.close,
+        cancelOnError: true,
+      );
+      final toLocal = upstream.input.listen(
+        client.add,
+        onDone: client.close,
+        cancelOnError: true,
+      );
+      try {
+        await client.done;
+      } finally {
+        await toRemote.cancel();
+        await toLocal.cancel();
+      }
     } catch (error) {
-      await connection?.close();
-      request.response
-        ..statusCode = HttpStatus.badGateway
-        ..write('Tailscale proxy error: $error');
-      await request.response.close();
+      if (!committed) {
+        final body = 'Tailscale proxy error: $error';
+        try {
+          client.add(utf8.encode(
+            'HTTP/1.1 502 Bad Gateway\r\n'
+            'Content-Length: ${body.length}\r\n'
+            'Connection: close\r\n\r\n$body',
+          ));
+        } catch (_) {}
+      }
+    } finally {
+      await sub.cancel();
+      if (!clientIn.isClosed) await clientIn.close();
+      if (conn != null) {
+        try {
+          await conn.abort();
+        } catch (_) {}
+      }
+      client.destroy();
     }
   }
 
-  Future<void> _handleConnect(HttpRequest request) async {
-    Socket? socket;
-    TailscaleConnection? connection;
-    var responseDetached = false;
-    try {
-      final target = _authorityTarget(request.uri);
-      connection = await _dial(target);
-      socket = await request.response.detachSocket();
-      responseDetached = true;
-      socket.write('HTTP/1.1 200 Connection Established\r\n\r\n');
-      final remote = connection;
-      final local = socket;
-      final localToRemote = local.listen(
-        (bytes) => remote.output.write(bytes),
-        onDone: remote.output.close,
-        cancelOnError: true,
-      );
-      final remoteToLocal = remote.input.listen(
-        local.add,
-        onDone: local.close,
-        cancelOnError: true,
-      );
-      await Future.any<void>([local.done, remote.done]);
-      await localToRemote.cancel();
-      await remoteToLocal.cancel();
-    } catch (error) {
-      await connection?.abort();
-      await socket?.close();
-      if (!responseDetached) {
-        request.response
-          ..statusCode = HttpStatus.badGateway
-          ..write('Tailscale tunnel error: $error');
-        await request.response.close();
+  /// authority-form target of a CONNECT: `host:port`, `host`, or `[v6]:port`.
+  Uri _authority(String authority) {
+    var host = authority;
+    var port = 443;
+    if (authority.startsWith('[')) {
+      final close = authority.indexOf(']');
+      host = authority.substring(1, close < 0 ? authority.length : close);
+      final rest = close < 0 ? '' : authority.substring(close + 1);
+      if (rest.startsWith(':') && rest.length > 1) {
+        port = int.parse(rest.substring(1));
+      }
+    } else {
+      final colon = authority.lastIndexOf(':');
+      if (colon > 0) {
+        host = authority.substring(0, colon);
+        port = int.parse(authority.substring(colon + 1));
       }
     }
+    return Uri(scheme: 'https', host: host, port: port);
   }
 
-  Uri _requestTarget(HttpRequest request) {
-    if (request.uri.hasScheme && request.uri.host.isNotEmpty) {
-      return request.uri;
+  Uri _target(String target, List<String> headers) {
+    if (target.contains('://')) return Uri.parse(target);
+    String? host;
+    for (final line in headers) {
+      final colon = line.indexOf(':');
+      if (colon > 0 && line.substring(0, colon).trim().toLowerCase() == 'host') {
+        host = line.substring(colon + 1).trim();
+        break;
+      }
     }
-    final host = request.headers.value('host');
-    if (host == null) {
+    if (host == null || host.isEmpty) {
       throw const FormatException('Proxy request has no Host header.');
     }
-    return Uri.parse(
-      'http://$host${request.uri.path.isEmpty ? '/' : request.uri}',
-    );
+    return Uri.parse('http://$host${target.isEmpty ? '/' : target}');
   }
 
-  Uri _authorityTarget(Uri uri) {
-    final authority = uri.toString();
-    final separator = authority.lastIndexOf(':');
-    if (separator <= 0) throw const FormatException('Invalid CONNECT target.');
-    return Uri.parse(
-      'https://${authority.substring(0, separator)}:${authority.substring(separator + 1)}',
-    );
+  String _originHead(
+    String method,
+    String version,
+    List<String> headers,
+    Uri dest,
+  ) {
+    final path = dest.path.isEmpty ? '/' : dest.path;
+    final target = dest.hasQuery ? '$path?${dest.query}' : path;
+    final buffer = StringBuffer('$method $target $version\r\n');
+    for (final line in headers) {
+      if (line.isEmpty) continue;
+      final colon = line.indexOf(':');
+      final name = (colon > 0 ? line.substring(0, colon) : line)
+          .trim()
+          .toLowerCase();
+      if (name == 'proxy-connection' || name == 'proxy-authorization') continue;
+      buffer.write('$line\r\n');
+    }
+    return '$buffer\r\n';
   }
 
   Future<TailscaleConnection> _dial(Uri target) {
@@ -496,104 +592,16 @@ class LocalForwardProxy {
     );
   }
 
-  String _requestHeaders(HttpRequest request, Uri target, int bodyLength) {
-    const hopByHop = <String>{
-      'connection',
-      'content-length',
-      'host',
-      'keep-alive',
-      'proxy-connection',
-      'te',
-      'trailers',
-      'transfer-encoding',
-      'upgrade',
-    };
-    final lines = <String>[];
-    request.headers.forEach((name, values) {
-      if (!hopByHop.contains(name.toLowerCase())) {
-        lines.add('$name: ${values.join(',')}');
-      }
-    });
-    lines
-      ..add(
-        'Host: ${target.hasPort ? '${target.host}:${target.port}' : target.host}',
-      )
-      ..add('Content-Length: $bodyLength')
-      ..add('Connection: close');
-    return '${lines.join('\r\n')}\r\n';
-  }
-
-  void _writeResponse(HttpResponse response, List<int> bytes) {
-    final separator = _headerEnd(bytes);
-    if (separator < 0) {
-      throw const FormatException('Invalid upstream response.');
-    }
-    final headerLines = utf8.decode(bytes.sublist(0, separator)).split('\r\n');
-    final status = headerLines.first.split(' ');
-    response.statusCode = int.parse(status[1]);
-    var chunked = false;
-    for (final line in headerLines.skip(1)) {
-      final colon = line.indexOf(':');
-      if (colon > 0) {
-        final name = line.substring(0, colon);
-        final value = line.substring(colon + 1).trim();
-        final lowerName = name.toLowerCase();
-        if (lowerName == 'transfer-encoding') {
-          chunked = value.toLowerCase().contains('chunked');
-        } else if (lowerName != 'content-length' && lowerName != 'connection') {
-          if (lowerName == 'set-cookie') {
-            response.headers.add(name, value);
-          } else {
-            response.headers.set(name, value);
-          }
-        }
-      }
-    }
-    final body = chunked
-        ? _decodeChunked(bytes.sublist(separator + 4))
-        : bytes.sublist(separator + 4);
-    response.contentLength = body.length;
-    response.add(body);
-    response.close();
-  }
-
-  List<int> _decodeChunked(List<int> bytes) {
-    final output = BytesBuilder();
-    var offset = 0;
-    while (offset < bytes.length) {
-      final lineEnd = _indexOf(bytes, const [13, 10], offset);
-      if (lineEnd < 0) throw const FormatException('Invalid chunked response.');
-      final size = int.tryParse(
-        utf8.decode(bytes.sublist(offset, lineEnd)).split(';').first,
-        radix: 16,
-      );
-      if (size == null) throw const FormatException('Invalid chunk size.');
-      if (size == 0) break;
-      final bodyStart = lineEnd + 2;
-      final bodyEnd = bodyStart + size;
-      if (bodyEnd + 2 > bytes.length) {
-        throw const FormatException('Incomplete chunked response.');
-      }
-      output.add(bytes.sublist(bodyStart, bodyEnd));
-      offset = bodyEnd + 2;
-    }
-    return output.takeBytes();
-  }
-
-  int _headerEnd(List<int> bytes) {
-    return _indexOf(bytes, const [13, 10, 13, 10]);
-  }
-
   int _indexOf(List<int> bytes, List<int> needle, [int start = 0]) {
-    for (var index = start; index <= bytes.length - needle.length; index++) {
+    for (var i = start; i <= bytes.length - needle.length; i++) {
       var matches = true;
-      for (var offset = 0; offset < needle.length; offset++) {
-        if (bytes[index + offset] != needle[offset]) {
+      for (var j = 0; j < needle.length; j++) {
+        if (bytes[i + j] != needle[j]) {
           matches = false;
           break;
         }
       }
-      if (matches) return index;
+      if (matches) return i;
     }
     return -1;
   }
